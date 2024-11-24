@@ -1,16 +1,12 @@
 // This file is taken from the original ktrl project's keys.rs file with modifications.
 
-use evdev::{EventType, InputEvent};
-use std::convert::TryFrom;
-
-use super::{KeyEvent, KeyValue, OsCode};
+use super::OsCode;
 
 impl OsCode {
-    pub const fn as_u16(self) -> u16 {
+    pub(super) const fn as_u16_linux(self) -> u16 {
         self as u16
     }
-
-    pub const fn from_u16(code: u16) -> Option<Self> {
+    pub(super) const fn from_u16_linux(code: u16) -> Option<Self> {
         match code {
             0 => Some(OsCode::KEY_RESERVED),
             1 => Some(OsCode::KEY_ESC),
@@ -757,28 +753,13 @@ impl OsCode {
             742 => Some(OsCode::BTN_TRIGGER_HAPPY39),
             743 => Some(OsCode::BTN_TRIGGER_HAPPY40),
             744 => Some(OsCode::BTN_MAX),
+            745 => Some(OsCode::MouseWheelUp),
+            746 => Some(OsCode::MouseWheelDown),
+            747 => Some(OsCode::MouseWheelLeft),
+            748 => Some(OsCode::MouseWheelRight),
             767 => Some(OsCode::KEY_MAX),
             _ => None,
         }
-    }
-}
-
-impl TryFrom<InputEvent> for KeyEvent {
-    type Error = ();
-    fn try_from(item: InputEvent) -> Result<Self, Self::Error> {
-        match item.kind() {
-            evdev::InputEventKind::Key(k) => Ok(Self {
-                code: OsCode::from_u16(k.0).ok_or(())?,
-                value: KeyValue::from(item.value()),
-            }),
-            _ => Err(()),
-        }
-    }
-}
-
-impl From<KeyEvent> for InputEvent {
-    fn from(item: KeyEvent) -> Self {
-        InputEvent::new(EventType::KEY, item.code as u16, item.value as i32)
     }
 }
 

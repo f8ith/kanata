@@ -1,23 +1,31 @@
 //! Contains the input/output code for keyboards on Linux.
 
-use evdev::{uinput, Device, EventType, InputEvent, RelativeAxisType};
+#![cfg_attr(feature = "simulated_output", allow(dead_code, unused_imports))]
+
+pub use evdev::BusType;
+use evdev::{uinput, Device, EventType, InputEvent, PropType, RelativeAxisType};
 use inotify::{Inotify, WatchMask};
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use nix::ioctl_read_buf;
 use rustc_hash::FxHashMap as HashMap;
 use signal_hook::{
-    consts::{SIGINT, SIGTERM},
+    consts::{SIGINT, SIGTERM, SIGTSTP},
     iterator::Signals,
 };
 
+use std::convert::TryFrom;
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
+use super::*;
+use crate::{kanata::CalculatedMouseMove, oskbd::KeyEvent};
+use kanata_parser::cfg::DeviceDetectMode;
+use kanata_parser::cfg::UnicodeTermination;
 use kanata_parser::custom_action::*;
-use kanata_parser::keys::KeyEvent;
 use kanata_parser::keys::*;
 
 pub struct KbdIn {
@@ -31,10 +39,13 @@ pub struct KbdIn {
     _inotify: Inotify,
     include_names: Option<Vec<String>>,
     exclude_names: Option<Vec<String>>,
+    device_detect_mode: DeviceDetectMode,
 }
 
 const INOTIFY_TOKEN_VALUE: usize = 0;
 const INOTIFY_TOKEN: Token = Token(INOTIFY_TOKEN_VALUE);
+
+pub static WAIT_DEVICE_MS: AtomicU64 = AtomicU64::new(200);
 
 impl KbdIn {
     pub fn new(
@@ -42,6 +53,7 @@ impl KbdIn {
         continue_if_no_devices: bool,
         include_names: Option<Vec<String>>,
         exclude_names: Option<Vec<String>>,
+        device_detect_mode: DeviceDetectMode,
     ) -> Result<Self, io::Error> {
         let poll = Poll::new()?;
 
@@ -53,7 +65,11 @@ impl KbdIn {
                 missing_device_paths.as_mut().expect("initialized"),
             )
         } else {
-            discover_devices(include_names.as_deref(), exclude_names.as_deref())
+            discover_devices(
+                include_names.as_deref(),
+                exclude_names.as_deref(),
+                device_detect_mode,
+            )
         };
         if devices.is_empty() {
             if continue_if_no_devices {
@@ -84,6 +100,7 @@ impl KbdIn {
             token_counter: INOTIFY_TOKEN_VALUE + 1,
             include_names,
             exclude_names,
+            device_detect_mode,
         };
 
         for (device, dev_path) in devices.into_iter() {
@@ -182,7 +199,7 @@ impl KbdIn {
             let discovered_devices = missing
                 .iter()
                 .filter_map(|dev_path| {
-                    for _ in 0..10 {
+                    for _ in 0..(WAIT_DEVICE_MS.load(Ordering::SeqCst) / 10) {
                         // try a few times with waits in between; device might not be ready
                         if let Ok(device) = Device::open(dev_path) {
                             return Some((device, dev_path.clone()));
@@ -204,84 +221,148 @@ impl KbdIn {
             missing.retain(|path| !paths_registered.contains(path));
         } else {
             log::info!("sleeping for a moment to let devices become ready");
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            discover_devices(self.include_names.as_deref(), self.exclude_names.as_deref())
-                .into_iter()
-                .try_for_each(|(dev, path)| {
-                    if !self
-                        .devices
-                        .values()
-                        .any(|(_, registered_path)| &path == registered_path)
-                    {
-                        self.register_device(dev, path)
-                    } else {
-                        Ok(())
-                    }
-                })?;
+            std::thread::sleep(std::time::Duration::from_millis(
+                WAIT_DEVICE_MS.load(Ordering::SeqCst),
+            ));
+            discover_devices(
+                self.include_names.as_deref(),
+                self.exclude_names.as_deref(),
+                self.device_detect_mode,
+            )
+            .into_iter()
+            .try_for_each(|(dev, path)| {
+                if !self
+                    .devices
+                    .values()
+                    .any(|(_, registered_path)| &path == registered_path)
+                {
+                    self.register_device(dev, path)
+                } else {
+                    Ok(())
+                }
+            })?;
         }
         Ok(())
     }
 }
 
-pub fn is_input_device(device: &Device) -> bool {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DeviceType {
+    Keyboard,
+    KeyboardMouse,
+    Mouse,
+    Other,
+}
+
+pub fn is_input_device(device: &Device, detect_mode: DeviceDetectMode) -> bool {
     use evdev::Key;
+    if device.name() == Some("kanata") {
+        return false;
+    }
     let is_keyboard = device
         .supported_keys()
         .map_or(false, |keys| keys.contains(Key::KEY_ENTER));
     let is_mouse = device
         .supported_relative_axes()
         .map_or(false, |axes| axes.contains(RelativeAxisType::REL_X));
-    if is_keyboard || is_mouse {
-        if device.name() == Some("kanata") {
-            return false;
+    let device_type = match (is_keyboard, is_mouse) {
+        (true, true) => DeviceType::KeyboardMouse,
+        (true, false) => DeviceType::Keyboard,
+        (false, true) => DeviceType::Mouse,
+        (false, false) => DeviceType::Other,
+    };
+    let device_name = device.name().unwrap_or("unknown device name");
+    match (detect_mode, device_type) {
+        (_, DeviceType::Other) => {
+            log::debug!("Use for input: false. Non-input device: {}", device_name,);
+            false
         }
-        log::debug!(
-            "Detected {}: name={} physical_path={:?}",
-            if is_keyboard && is_mouse {
-                "Keyboard/Mouse"
-            } else if is_keyboard {
-                "Keyboard"
-            } else {
-                "Mouse"
-            },
-            device.name().unwrap_or("unknown device name"),
-            device.physical_path()
-        );
-        true
-    } else {
-        log::trace!(
-            "Detected other device: {}",
-            device.name().unwrap_or("unknown device name")
-        );
-        false
+        (DeviceDetectMode::Any, _)
+        | (DeviceDetectMode::KeyboardMice, DeviceType::Keyboard | DeviceType::KeyboardMouse)
+        | (DeviceDetectMode::KeyboardOnly, DeviceType::Keyboard) => {
+            log::debug!(
+                "Use for input: true. detect type {:?}; device type {:?}, device name: {}",
+                detect_mode,
+                device_type,
+                device_name,
+            );
+            true
+        }
+        _ => {
+            log::debug!(
+                "Use for input: false. detect type {:?}; device type {:?}, device name: {}",
+                detect_mode,
+                device_type,
+                device_name,
+            );
+            true
+        }
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum UnicodeTermination {
-    Enter,
-    Space,
-    SpaceEnter,
-    EnterSpace,
+impl TryFrom<InputEvent> for KeyEvent {
+    type Error = ();
+    fn try_from(item: InputEvent) -> Result<Self, Self::Error> {
+        use OsCode::*;
+        match item.kind() {
+            evdev::InputEventKind::Key(k) => Ok(Self {
+                code: OsCode::from_u16(k.0).ok_or(())?,
+                value: KeyValue::from(item.value()),
+            }),
+            evdev::InputEventKind::RelAxis(axis_type) => {
+                let dist = item.value();
+                let code: OsCode = match axis_type {
+                    RelativeAxisType::REL_WHEEL | RelativeAxisType::REL_WHEEL_HI_RES => {
+                        if dist > 0 {
+                            MouseWheelUp
+                        } else {
+                            MouseWheelDown
+                        }
+                    }
+                    RelativeAxisType::REL_HWHEEL | RelativeAxisType::REL_HWHEEL_HI_RES => {
+                        if dist > 0 {
+                            MouseWheelRight
+                        } else {
+                            MouseWheelLeft
+                        }
+                    }
+                    _ => return Err(()),
+                };
+                Ok(KeyEvent {
+                    code,
+                    value: KeyValue::Tap,
+                })
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<KeyEvent> for InputEvent {
+    fn from(item: KeyEvent) -> Self {
+        InputEvent::new(EventType::KEY, item.code as u16, item.value as i32)
+    }
 }
 
 use std::cell::Cell;
 
+#[cfg(all(not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
 pub struct KbdOut {
     device: uinput::VirtualDevice,
     accumulated_scroll: u16,
     accumulated_hscroll: u16,
-    #[allow(dead_code)] // stored here for persistence+cleanup on exit
-    symlink: Option<Symlink>,
     raw_buf: Vec<InputEvent>,
     pub unicode_termination: Cell<UnicodeTermination>,
     pub unicode_u_code: Cell<OsCode>,
 }
 
-pub const HI_RES_SCROLL_UNITS_IN_LO_RES: u16 = 120;
-
+#[cfg(all(not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
 impl KbdOut {
-    pub fn new(symlink_path: &Option<String>) -> Result<Self, io::Error> {
+    pub fn new(
+        symlink_path: &Option<String>,
+        trackpoint: bool,
+        bus_type: BusType,
+    ) -> Result<Self, io::Error> {
         // Support pretty much every feature of a Keyboard or a Mouse in a VirtualDevice so that no event from the original input devices gets lost
         // TODO investigate the rare possibility that a device is e.g. a Joystick and a Keyboard or a Mouse at the same time, which could lead to lost events
 
@@ -302,12 +383,19 @@ impl KbdOut {
             RelativeAxisType::REL_HWHEEL_HI_RES,
         ]);
 
-        let mut device = uinput::VirtualDeviceBuilder::new()?
+        let device = uinput::VirtualDeviceBuilder::new()?
             .name("kanata")
-            .input_id(evdev::InputId::new(evdev::BusType::BUS_USB, 1, 1, 1))
+            // libinput's "disable while typing" feature don't work when bus_type
+            // is set to BUS_USB, but appears to work when it's set to BUS_I8042.
+            .input_id(evdev::InputId::new(bus_type, 1, 1, 1))
             .with_keys(&keys)?
-            .with_relative_axes(&relative_axes)?
-            .build()?;
+            .with_relative_axes(&relative_axes)?;
+        let device = if trackpoint {
+            device.with_properties(&evdev::AttributeSet::from_iter([PropType::POINTING_STICK]))?
+        } else {
+            device
+        };
+        let mut device = device.build()?;
         let devnode = device
             .enumerate_dev_nodes_blocking()?
             .next() // Expect only one. Using fold or calling next again blocks indefinitely
@@ -316,17 +404,16 @@ impl KbdOut {
         let symlink = if let Some(symlink_path) = symlink_path {
             let dest = PathBuf::from(symlink_path);
             let symlink = Symlink::new(devnode, dest)?;
-            Symlink::clean_when_killed(symlink.clone());
             Some(symlink)
         } else {
             None
         };
+        handle_signals(symlink);
 
         Ok(KbdOut {
             device,
             accumulated_scroll: 0,
             accumulated_hscroll: 0,
-            symlink,
             raw_buf: vec![],
 
             // historically was the only option, so make Enter the default
@@ -519,14 +606,28 @@ impl KbdOut {
         }
     }
 
-    pub fn move_mouse(&mut self, direction: MoveDirection, distance: u16) -> Result<(), io::Error> {
-        let (axis, distance) = match direction {
-            MoveDirection::Up => (RelativeAxisType::REL_Y, -i32::from(distance)),
-            MoveDirection::Down => (RelativeAxisType::REL_Y, i32::from(distance)),
-            MoveDirection::Left => (RelativeAxisType::REL_X, -i32::from(distance)),
-            MoveDirection::Right => (RelativeAxisType::REL_X, i32::from(distance)),
+    pub fn move_mouse(&mut self, mv: CalculatedMouseMove) -> Result<(), io::Error> {
+        let (axis, distance) = match mv.direction {
+            MoveDirection::Up => (RelativeAxisType::REL_Y, -i32::from(mv.distance)),
+            MoveDirection::Down => (RelativeAxisType::REL_Y, i32::from(mv.distance)),
+            MoveDirection::Left => (RelativeAxisType::REL_X, -i32::from(mv.distance)),
+            MoveDirection::Right => (RelativeAxisType::REL_X, i32::from(mv.distance)),
         };
         self.write(InputEvent::new(EventType::RELATIVE, axis.0, distance))
+    }
+
+    pub fn move_mouse_many(&mut self, moves: &[CalculatedMouseMove]) -> Result<(), io::Error> {
+        let mut events = vec![];
+        for mv in moves {
+            let (axis, distance) = match mv.direction {
+                MoveDirection::Up => (RelativeAxisType::REL_Y, -i32::from(mv.distance)),
+                MoveDirection::Down => (RelativeAxisType::REL_Y, i32::from(mv.distance)),
+                MoveDirection::Left => (RelativeAxisType::REL_X, -i32::from(mv.distance)),
+                MoveDirection::Right => (RelativeAxisType::REL_X, i32::from(mv.distance)),
+            };
+            events.push(InputEvent::new(EventType::RELATIVE, axis.0, distance));
+        }
+        self.write_many(&events)
     }
 
     pub fn set_mouse(&mut self, _x: u16, _y: u16) -> Result<(), io::Error> {
@@ -556,6 +657,7 @@ fn devices_from_input_paths(
 fn discover_devices(
     include_names: Option<&[String]>,
     exclude_names: Option<&[String]>,
+    device_detect_mode: DeviceDetectMode,
 ) -> Vec<(Device, String)> {
     log::info!("looking for devices in /dev/input");
     let devices: Vec<_> = evdev::enumerate()
@@ -568,7 +670,7 @@ fn discover_devices(
             )
         })
         .filter(|pd| {
-            is_input_device(&pd.0)
+            is_input_device(&pd.0, device_detect_mode)
                 && match include_names {
                     None => true,
                     Some(include_names) => {
@@ -600,8 +702,8 @@ fn discover_devices(
 }
 
 fn watch_devinput() -> Result<Inotify, io::Error> {
-    let mut inotify = Inotify::init().expect("Failed to initialize inotify");
-    inotify.add_watch("/dev/input", WatchMask::CREATE)?;
+    let inotify = Inotify::init().expect("Failed to initialize inotify");
+    inotify.watches().add("/dev/input", WatchMask::CREATE)?;
     Ok(inotify)
 }
 
@@ -629,42 +731,28 @@ impl Symlink {
         log::info!("Created symlink {:#?} -> {:#?}", dest, source);
         Ok(Self { dest })
     }
-
-    fn clean_when_killed(symlink: Self) {
-        thread::spawn(|| {
-            let mut signals = Signals::new([SIGINT, SIGTERM]).expect("signals register");
-            for signal in &mut signals {
-                match signal {
-                    SIGINT | SIGTERM => {
-                        drop(symlink);
-                        signal_hook::low_level::emulate_default_handler(signal)
-                            .expect("run original sighandlers");
-                        unreachable!();
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        });
-    }
 }
 
-pub fn parse_colon_separated_text(paths: &str) -> Vec<String> {
-    let mut all_paths = vec![];
-    let mut full_dev_path = String::new();
-    let mut dev_path_iter = paths.split(':').peekable();
-    while let Some(dev_path) = dev_path_iter.next() {
-        if dev_path.ends_with('\\') && dev_path_iter.peek().is_some() {
-            full_dev_path.push_str(dev_path.trim_end_matches('\\'));
-            full_dev_path.push(':');
-            continue;
-        } else {
-            full_dev_path.push_str(dev_path);
+fn handle_signals(symlink: Option<Symlink>) {
+    thread::spawn(|| {
+        let mut signals = Signals::new([SIGINT, SIGTERM, SIGTSTP]).expect("signals register");
+        if let Some(signal) = (&mut signals).into_iter().next() {
+            match signal {
+                SIGINT | SIGTERM => {
+                    drop(symlink);
+                    signal_hook::low_level::emulate_default_handler(signal)
+                        .expect("run original sighandlers");
+                    unreachable!();
+                }
+                SIGTSTP => {
+                    drop(symlink);
+                    log::warn!("got SIGTSTP, exiting instead of pausing so keyboards don't hang");
+                    std::process::exit(SIGTSTP);
+                }
+                _ => unreachable!(),
+            }
         }
-        all_paths.push(full_dev_path.clone());
-        full_dev_path.clear();
-    }
-    all_paths.shrink_to_fit();
-    all_paths
+    });
 }
 
 // Note for allow: the ioctl_read_buf triggers this clippy lint.
@@ -694,13 +782,6 @@ fn wait_for_all_keys_unpressed(dev: &Device) -> Result<(), io::Error> {
         std::thread::sleep(std::time::Duration::from_micros(100));
     }
     Ok(())
-}
-
-#[test]
-fn test_parse_dev_paths() {
-    assert_eq!(parse_colon_separated_text("h:w"), ["h", "w"]);
-    assert_eq!(parse_colon_separated_text("h\\:w"), ["h:w"]);
-    assert_eq!(parse_colon_separated_text("h\\:w\\"), ["h:w\\"]);
 }
 
 impl Drop for Symlink {

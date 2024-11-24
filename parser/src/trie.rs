@@ -1,64 +1,77 @@
 //! Wrapper around a trie type for (hopefully) easier swapping of libraries if desired.
 
-use radix_trie::TrieCommon;
+use bytemuck::cast_slice;
+use patricia_tree::map::PatriciaMap;
 
-pub type TrieKey = Vec<u16>;
-pub type TrieVal = (u8, u16);
+pub type TrieKeyElement = u16;
 
-pub struct Trie {
-    inner: radix_trie::Trie<TrieKey, TrieVal>,
+#[derive(Debug, Clone)]
+pub struct Trie<T> {
+    inner: patricia_tree::map::PatriciaMap<T>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum GetOrDescendentExistsResult {
+pub enum GetOrDescendentExistsResult<T> {
     NotInTrie,
     InTrie,
-    HasValue(TrieVal),
+    HasValue(T),
 }
 
 use GetOrDescendentExistsResult::*;
 
-impl Trie {
+impl<T> Default for Trie<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn key_len(k: impl AsRef<[u16]>) -> usize {
+    debug_assert!(std::mem::size_of::<TrieKeyElement>() == 2 * std::mem::size_of::<u8>());
+    k.as_ref().len() * 2
+}
+
+impl<T> Trie<T> {
     pub fn new() -> Self {
         Self {
-            inner: radix_trie::Trie::new(),
+            inner: PatriciaMap::new(),
         }
     }
 
-    pub fn ancestor_exists(&self, key: &TrieKey) -> bool {
-        self.inner.get_ancestor(key).is_some()
+    pub fn ancestor_exists(&self, key: impl AsRef<[u16]>) -> bool {
+        self.inner
+            .get_longest_common_prefix(cast_slice(key.as_ref()))
+            .is_some()
     }
 
-    pub fn descendant_exists(&self, key: &TrieKey) -> bool {
-        self.inner.get_raw_descendant(key).is_some()
+    pub fn descendant_exists(&self, key: impl AsRef<[u16]>) -> bool {
+        // Length of the [u8] interpretation of the [u16] key is doubled.
+        self.inner
+            .longest_common_prefix_len(cast_slice(key.as_ref()))
+            == key_len(key)
     }
 
-    pub fn insert(&mut self, key: TrieKey, val: TrieVal) {
-        self.inner.insert(key, val);
+    pub fn insert(&mut self, key: impl AsRef<[u16]>, val: T) {
+        self.inner.insert(cast_slice(key.as_ref()), val);
     }
 
-    pub fn get_or_descendant_exists(&self, key: &TrieKey) -> GetOrDescendentExistsResult {
-        let descendant = self.inner.get_raw_descendant(key);
-        match descendant {
+    pub fn get_or_descendant_exists(&self, key: impl AsRef<[u16]>) -> GetOrDescendentExistsResult<T>
+    where
+        T: Clone,
+    {
+        let mut descendants = self.inner.iter_prefix(cast_slice(key.as_ref()));
+        match descendants.next() {
             None => NotInTrie,
-            Some(subtrie) => {
-                // If the key exists in this subtrie, returns the value. Otherwise returns
-                // KeyInTrie.
-                match subtrie.key() {
-                    Some(stkey) => {
-                        if key == stkey {
-                            HasValue(*subtrie.value().expect("node has value"))
-                        } else {
-                            InTrie
-                        }
-                    }
-                    None => {
-                        // Note: None happens if there are multiple children. The sequence is still
-                        // in the trie.
-                        InTrie
-                    }
+            Some(descendant) => {
+                if descendant.0.len() == key_len(key.as_ref()) {
+                    HasValue(descendant.1.clone())
+                } else {
+                    InTrie
                 }
             }
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }

@@ -2,27 +2,43 @@
 
 use std::io;
 
-use kanata_interception::{Interception, KeyState, MouseFlags, MouseState, Stroke};
-
-use kanata_parser::custom_action::*;
-use kanata_parser::keys::*;
+use kanata_interception::{Interception, KeyState, MouseFlags, MouseState, ScanCode, Stroke};
 
 use super::OsCodeWrapper;
+use crate::kanata::CalculatedMouseMove;
+use crate::oskbd::KeyValue;
+use kanata_parser::custom_action::*;
+use kanata_parser::keys::*;
 
 /// Key event received by the low level keyboard hook.
 #[derive(Debug, Clone, Copy)]
 pub struct InputEvent(pub Stroke);
 
+use std::fmt;
+impl fmt::Display for InputEvent {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 impl InputEvent {
     fn from_oscode(code: OsCode, val: KeyValue) -> Self {
-        let mut stroke =
-            Stroke::try_from(OsCodeWrapper(code)).expect("kanata only sends mapped `OsCode`s");
+        let mut stroke = Stroke::try_from(OsCodeWrapper(code)).unwrap_or_else(|_| {
+            log::error!("Trying to send unmapped oscode '{code:?}', sending esc instead");
+            Stroke::Keyboard {
+                code: ScanCode::Esc,
+                state: KeyState::empty(),
+                information: 0,
+            }
+        });
         match &mut stroke {
             Stroke::Keyboard { state, .. } => {
                 state.set(
                     match val {
                         KeyValue::Press | KeyValue::Repeat => KeyState::DOWN,
                         KeyValue::Release => KeyState::UP,
+                        KeyValue::Tap => panic!("invalid value attempted to be sent"),
+                        KeyValue::WakeUp => panic!("invalid value attempted to be sent"),
                     },
                     true,
                 );
@@ -41,10 +57,10 @@ impl InputEvent {
                 (Btn::Right, false) => MouseState::RIGHT_BUTTON_DOWN,
                 (Btn::Mid, true) => MouseState::MIDDLE_BUTTON_UP,
                 (Btn::Mid, false) => MouseState::MIDDLE_BUTTON_DOWN,
-                (Btn::Backward, true) => MouseState::BUTTON_4_DOWN,
-                (Btn::Backward, false) => MouseState::BUTTON_4_UP,
-                (Btn::Forward, true) => MouseState::BUTTON_5_DOWN,
-                (Btn::Forward, false) => MouseState::BUTTON_5_UP,
+                (Btn::Backward, true) => MouseState::BUTTON_4_UP,
+                (Btn::Backward, false) => MouseState::BUTTON_4_DOWN,
+                (Btn::Forward, true) => MouseState::BUTTON_5_UP,
+                (Btn::Forward, false) => MouseState::BUTTON_5_DOWN,
             },
             flags: MouseFlags::empty(),
             rolling: 0,
@@ -94,6 +110,29 @@ impl InputEvent {
         })
     }
 
+    fn from_mouse_move_many(moves: &[CalculatedMouseMove]) -> Self {
+        let mut x_acc = 0;
+        let mut y_acc = 0;
+        for mov in moves {
+            let acc_change = match mov.direction {
+                MoveDirection::Up => (0, -i32::from(mov.distance)),
+                MoveDirection::Down => (0, i32::from(mov.distance)),
+                MoveDirection::Left => (-i32::from(mov.distance), 0),
+                MoveDirection::Right => (i32::from(mov.distance), 0),
+            };
+            x_acc += acc_change.0;
+            y_acc += acc_change.1;
+        }
+        Self(Stroke::Mouse {
+            state: MouseState::MOVE,
+            flags: MouseFlags::empty(),
+            rolling: 0,
+            x: x_acc,
+            y: y_acc,
+            information: 0,
+        })
+    }
+
     fn from_mouse_set(x: u16, y: u16) -> Self {
         Self(Stroke::Mouse {
             state: MouseState::MOVE,
@@ -110,6 +149,7 @@ thread_local! {
     static INTRCPTN: Interception = Interception::new().expect("interception driver should init: have you completed the interception driver installation?");
 }
 
+#[cfg(all(not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
 /// Handle for writing keys to the OS.
 pub struct KbdOut {}
 
@@ -131,6 +171,7 @@ fn write_interception(event: InputEvent) {
     })
 }
 
+#[cfg(all(not(feature = "simulated_output"), not(feature = "passthru_ahk")))]
 impl KbdOut {
     pub fn new() -> Result<Self, io::Error> {
         Ok(Self {})
@@ -183,8 +224,13 @@ impl KbdOut {
         Ok(())
     }
 
-    pub fn move_mouse(&mut self, direction: MoveDirection, distance: u16) -> Result<(), io::Error> {
-        write_interception(InputEvent::from_mouse_move(direction, distance));
+    pub fn move_mouse(&mut self, mv: CalculatedMouseMove) -> Result<(), io::Error> {
+        write_interception(InputEvent::from_mouse_move(mv.direction, mv.distance));
+        Ok(())
+    }
+
+    pub fn move_mouse_many(&mut self, moves: &[CalculatedMouseMove]) -> Result<(), io::Error> {
+        write_interception(InputEvent::from_mouse_move_many(moves));
         Ok(())
     }
 

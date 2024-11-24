@@ -4,6 +4,9 @@ use crate::key_code::KeyCode;
 use crate::layout::{QueuedIter, WaitingAction};
 use core::fmt::Debug;
 
+pub mod switch;
+pub use switch::*;
+
 /// The different types of actions we support for key sequences/macros
 #[non_exhaustive]
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -81,7 +84,10 @@ pub enum HoldTapConfig<'a> {
     /// value will cause a fallback to the timeout-based approach. If the
     /// timeout is not triggered, the next tick will call the custom handler
     /// again.
-    Custom(&'a (dyn Fn(QueuedIter) -> Option<WaitingAction> + Send + Sync)),
+    /// The bool value defines if the timeout check should be skipped at the
+    /// next tick. This should generally be false. This is used by `tap-hold-
+    /// except-keys` to handle presses even when the timeout has been reached.
+    Custom(&'a (dyn Fn(QueuedIter) -> (Option<WaitingAction>, bool) + Send + Sync)),
 }
 
 impl<'a> Debug for HoldTapConfig<'a> {
@@ -276,7 +282,7 @@ impl<'a, T> ChordsGroup<'a, T> {
 /// A set of virtual keys (represented as a bit mask) pressed together.
 /// The keys do not directly correspond to physical keys. They are unique to a given [ChordGroup] and their mapping from physical keys is definied in [ChordGroup.coords].
 /// As such, each chord group can effectively have at most 32 different keys (though multiple physical keys may be mapped to the same virtual key).
-pub type ChordKeys = u32;
+pub type ChordKeys = u128;
 
 /// Defines the maximum number of (virtual) keys that can be used in a single chords group.
 pub const MAX_CHORD_KEYS: usize = ChordKeys::BITS as usize;
@@ -352,6 +358,8 @@ where
     /// key will hold space until either another key is pressed or the timeout occurs, which will
     /// probably send many undesired space characters to your active application.
     OneShot(&'a OneShot<'a, T>),
+    /// An action to ignore processing of events for OneShot.
+    OneShotIgnoreEventsTicks(u16),
     /// Tap-dance key. When tapping the key N times in quck succession, activates the N'th action
     /// in `actions`. The action will activate in the following conditions:
     ///
@@ -373,6 +381,15 @@ where
     /// Fork action that can activate one of two potential actions depending on what keys are
     /// currently active.
     Fork(&'a ForkConfig<'a, T>),
+    /// Action that can activate 0 to N actions based on what keys are currently
+    /// active and the boolean logic of each case.
+    ///
+    /// The maximum number of actions that can activate the same time is governed by
+    /// `ACTION_QUEUE_LEN`.
+    Switch(&'a Switch<'a, T>),
+    /// Disregard the entire layer stack, i.e. the current base layer and any while-held layers,
+    /// and select the action from `Layout.src_keys`.
+    Src,
 }
 
 impl<'a, T> Action<'a, T> {
